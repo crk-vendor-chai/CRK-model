@@ -1,0 +1,490 @@
+"""env 기반 설정 — 원본 `MODEL__*` 관행 보존 (레버별 독립 플래그 + 즉시 롤백 env).
+
+.env 파싱은 호스트 어댑터 소관. 여기서는 os.environ만 읽는다 (의존성 0).
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from crk_model.core.policy import ErrorSessionPolicy
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.environ.get(key)
+    return float(raw) if raw else default
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key)
+    return int(raw) if raw else default
+
+
+def _env_opt_float(key: str) -> float | None:
+    raw = os.environ.get(key)
+    return float(raw) if raw not in (None, "") else None
+
+
+def _env_opt_int(key: str) -> int | None:
+    raw = os.environ.get(key)
+    return int(raw) if raw not in (None, "") else None
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_zones(key: str) -> tuple[int, ...]:
+    raw = os.environ.get(key, "")
+    return tuple(int(z) for z in raw.split(",") if z.strip())
+
+
+_VALID_CABINET_TYPES = ("refrigerated", "freezer")
+
+_VALID_CAMERA_LAYOUTS = ("dual", "dual_top_proxy")
+
+
+def _env_choice(key: str, default: str, valid: tuple[str, ...]) -> str:
+    raw = os.environ.get(key)
+    if not raw:
+        return default
+    normalized = raw.strip().lower()
+    if normalized not in valid:
+        # fail-closed: 오타가 조용히 기본값이 되면 의도한 구성이 아닌 채
+        # 운영되고 있음을 알 수 없다 (cabinet_type과 동일 원칙).
+        raise ValueError(f"Invalid value for {key}: {raw}")
+    return normalized
+
+
+def _env_cabinet_type(key: str, default: str) -> str:
+    raw = os.environ.get(key)
+    if not raw:
+        return default
+    normalized = raw.strip().lower()
+    if normalized not in _VALID_CABINET_TYPES:
+        # 원본 MachineModel.validate_cabinet_type 대응 — 오타/잘못된 값이 조용히
+        # "refrigerated"로 폴백되는 것을 막는다 (fail-closed: 냉동 기기가 냉장
+        # 프로파일로 동작하는 사고 재발 방지).
+        raise ValueError(f"Invalid cabinet type: {raw}")
+    return normalized
+
+
+@dataclass(frozen=True)
+class Settings:
+    # I17: 인과 배리어 상한 타임아웃 (정상 경로 아님 — debounce 3s보다 길게)
+    close_timeout_s: float = 10.0
+    # CLOSE 유예 창 (issue #8, 원본 close_initial_wait_seconds 복원): 배리어가
+    # 충족돼도 CLOSE·마지막 트리거 도착 후 이 시간 동안 확정을 보류 — 카메라가
+    # 아직 쓰고 있는 AVI의 late trigger 유실(0원 확정+rejected) 방지. seq
+    # 워터마크(D2) 배포 전까지의 유일한 방어. 0이면 비활성.
+    close_grace_s: float = 3.0
+    # queue_pending(워커 처리 중)은 유실이 아니라 진행 중 — Jetson 디코드+TRT
+    # 추론이 close_timeout보다 길 수 있어 별도의 넉넉한 stall 상한을 적용한다.
+    # 이 상한 초과 = 워커 사망/행 (I17 fail-closed 유지)
+    worker_stall_timeout_s: float = 120.0
+    # 0723 이슈 #17: freezer close 재solve의 단일 종 ×N 스냅(N≥2)·게이트 실패
+    # 시, 존의 자격 표를 받은 2종 조합이 게이트 안에서 net을 설명하면 조합
+    # 우선 ("무게=거부권, 선택=vision"). settler._vision_combo 참조.
+    close_vision_combo: bool = True
+    # 12차: 콤보 소수 클래스의 실존 증거 하한 — top 대비 득표율 또는 conf 중
+    # 하나는 넘어야 자격 (오분류 플리커 7~9표가 정상 ×N 스냅을 쪼개는 사고
+    # 차단). ratio=0으로 하한 비활성. settler._vision_combo 참조.
+    close_combo_min_vote_ratio: float = 0.5
+    close_combo_min_conf: float = 0.8
+    # 12차: 세션 관측 증거 기반 콤보 자격 제외(ghost / 타존 무게 뒷받침) —
+    # 동시 멀티존 취출의 공유 영상 표 유입 차단 (ses-5).
+    close_combo_session_guard: bool = True
+    # 14차: 게이트 안 스냅을 콤보가 뒤집으려면 존 판정 conf가 이 값 미만
+    # (확신 스냅 존중 — 오버라이드 오답 6건 전부 conf 0.96~1.0). >1로 비활성.
+    close_combo_override_max_conf: float = 0.95
+    # D8/T2-2: 게이트 통과 프레임 마이크로배치 크기. 기본 OFF(1) — >1은
+    # 정적 batch 엔진 재수출(scripts/convert_engine.sh BATCH=N) 전제.
+    batch_size: int = 1
+    # T2-3: 카메라별 백그라운드 선행 디코드 깊이 (0 = 비활성 — 현행 직렬).
+    # 활성 시 top 추론 중 side 디코드가 은닉된다. 메모리 depth×691KB/카메라.
+    prefetch_depth: int = 0
+    # T2-1 단독 스위치: batch_size=1(기존 batch-1 엔진 그대로)에서도 추론을
+    # detect_batch 경로로 보내 **GPU 전처리만** 취한다 — (1,3,480,480) 텐서는
+    # batch-1 엔진과 shape이 맞아 재수출이 불필요. 배치 상각(T2-2)과 전처리
+    # 소멸(T2-1)의 효과를 기기에서 분리 측정하는 변인 스위치. batch_size>1
+    # 이면 배치 경로가 이미 텐서 투입이라 이 값은 무의미(중복).
+    tensor_input: bool = False
+    # freezer 프로파일을 적용할 존 목록 (예: "9,10") — cabinet_type이 정하는
+    # 기본 프로파일에 대한 존 단위 오버라이드로만 쓰인다 (freezer 기기에서
+    # 특정 존만 냉장인 경우 등은 현재 스코프 밖).
+    freezer_zones: tuple[int, ...] = field(default_factory=tuple)
+    # 기기 단위 정적 설정 (원본 MachineModel.cabinet_type 대응, config.py
+    # 60-75행). "refrigerated"|"freezer" — 실기가 냉동이면 반드시 명시해야
+    # 한다. 미설정 시 기본값(refrigerated)이 전 존에 냉장 ±5g 프로파일을
+    # 적용해 이슈 #6의 공동 원인이 됐다.
+    cabinet_type: str = "refrigerated"
+    # D9: Node 합의(P4) 전 기본값은 fail-closed
+    error_policy: ErrorSessionPolicy = ErrorSessionPolicy.BLOCK_PAYMENT
+    # I7: 트리거 멱등성 TTL
+    idempotency_ttl_s: float = 5.0
+    # 무한 성장 방지: worker.outcomes 트레이스 보존 개수 상한 (I8, 24h+ soak 대비)
+    outcomes_keep: int = 256
+    # 무한 성장 방지: EventLog/settler 멱등 캐시에서 보존할 최근 세션 개수
+    # (I11: 현재+직전 세션은 항상 보존 — CLOSE 재폴링이 새 OPEN 직후 섞여 들어올 수 있음)
+    keep_sessions: int = 4
+    # 무한 성장 방지: EventJournal 일자별 로테이션 파일 보존기간(일)
+    journal_retention_days: int = 14
+    # 세션 YAML 아카이브 (issue #6: 오판정 사후 분석용) — 빈 문자열이면 비활성.
+    session_archive_dir: str = "data/sessions"
+    session_archive_retention_days: int = 14
+    # 프레임별 bbox 기록 (render-session 시각 검증용): 추론 프레임의 raw 검출
+    # + 필터 통과 여부를 아카이브 trace.frame_detections에 동봉한다. 기본 off
+    # — 실기 품질 확인 기간에만 켠다 (아카이브 용량 증가: 트리거당 수십~수백 KB).
+    save_detections: bool = False
+    # ---- 비전 투표 튜닝 (issue #6 2차: 실기 vote_summary로 conf_floor 전멸 확정) ----
+    # 카메라별 투표 진입 임계 — 원본 top/side_confidence_threshold 대응 (코드 기본
+    # 0.70, 원본 운영 .env.example은 0.50). 이 값 미만 검출은 투표에 진입하지 못해
+    # 노이즈가 평균 conf를 희석하지 않는다 (원본의 노이즈 방어 지점).
+    top_confidence_threshold: float = 0.70
+    side_confidence_threshold: float = 0.70
+    # 후보 채택 임계 — 원본 min_vote_ratio/min_vote_count 대응.
+    min_vote_ratio: float = 0.05
+    min_vote_count: int = 3
+    # vote_ratio 분모 정의 (이슈 #18 후속): "gate"(현행) | "hand_window"
+    # (손 활성 프레임 — 프리롤·포스트롤 희석 제거, voting.py 주석 참조).
+    vote_ratio_denominator: str = "gate"
+    # 1위 후보 득표 대비 상대 하한 (이슈 #10): 절대 count(3)는 400프레임+
+    # 영상에서 노이즈도 통과시켜 저득표 후보가 "무게 filler"로 채택되는
+    # 사고(메로나 79g×3)의 원인이 됐다. votes < top×share 후보 제거.
+    min_vote_share: float = 0.1
+    # 결합 후 weighted_conf 하한 — 원본에는 없는 파라미터 (원본 동형 = 0.0).
+    # 진입 컷이 노이즈를 이미 거르므로 기본 0.0. 진입 컷을 0으로 낮춰 저신뢰
+    # 투표를 보존하고 싶을 때만 안전판으로 올려 쓴다.
+    vote_conf_floor: float = 0.0
+    # 카메라 conf 결합 가중 (voting._weighted_confidence, 원본 combine()
+    # 427-458행 동형 — P1-4): 양카메라 검출 시
+    #   weighted = top·W_TOP + side·W_SIDE + min(top,side)·COMMON_CLASS_BONUS,
+    # 단일 카메라 검출 시 전용 *_ONLY 가중을 곱한다 (한쪽 conf 반토막 방지).
+    # 기본값은 원본 운영값(0.60/0.40/0.2) — 실기에서 카메라별 신뢰도 차이가
+    # 확인되면 env로만 조정한다 (예: side 오검출 과다 시 SIDE를 내림).
+    conf_weight_top: float = 0.60
+    conf_weight_side: float = 0.40
+    conf_weight_top_only: float = 0.60
+    conf_weight_side_only: float = 0.40
+    conf_common_class_bonus: float = 0.2
+    # Side ROI: 존 바깥(오른쪽) 검출 제거 경계 — 카메라 장착에 맞게 조정
+    # 가능해야 한다. 기본 400은 center-crop 480×480 좌표계에서의 값
+    # (원본 left-crop 좌표계의 side_roi_x_max=400을 그대로 이식 — 2026-07-24
+    # center-crop 전환으로 크롭 원점이 이동했으므로 실기 재측정 필요).
+    # 구값 240은 squash resize 좌표계 산물로, 실기에서 side 검출 194/195가
+    # 제거되던 원인이었다. 냉장 실기(side_camera_crop=left)는 좌 0~300만
+    # 사용 — refrg.env.example의 300 참조 (2026-07-28 사용자 결정).
+    side_roi_max_center_x: float = 400.0
+    # side 카메라 크롭 원점 (2026-07-28 냉장 실기): "center"(기본, 기존 동작)
+    # | "left" — 냉장 기기는 존이 side 화면 왼쪽에 있어 x=0..480 left-crop
+    # (원본 엔진 좌표계 복원)을 쓴다. top 카메라는 항상 center.
+    side_camera_crop: str = "center"
+    # ---- 수직 ROI (원본 정합 웨이브 2 — perf-gap P1-5 이식) ----
+    # camera_layout: "dual"(top+side, 기본) | "dual_top_proxy"(냉동 실기 —
+    #   side 스트림도 top 뷰). dual_top_proxy + cabinet_type=freezer면 두
+    #   카메라 모두 freezer 수직 ROI(기본 상단 절반)를 적용하고 side x-ROI는
+    #   생략한다 (원본 _uses_freezer_dual_top_profile 동형).
+    # freezer_roi_vertical_region/y_split: 유지할 절반과 분할선 (center-crop
+    #   480×480 좌표계 — y_split은 세로축이라 crop 원점 이동(가로) 영향 없음).
+    #   원본 운영값은 upper/240이었으나 300으로 상향(2026-07-24, 사용자 결정).
+    # top_roi_enabled/y_split: 냉장(dual) 레이아웃 top 카메라 전용 —
+    #   delta가 0이 아닐 때 하단 절반(center_y >= split)만 유지. 원본 기본은
+    #   true지만 HG는 냉동 dual-top 실기가 우선이라 보수적으로 off — 냉장
+    #   레이아웃 투입 시 켠다.
+    camera_layout: str = "dual"
+    freezer_roi_vertical_region: str = "upper"
+    freezer_roi_y_split: float = 300.0
+    top_roi_enabled: bool = False
+    top_roi_y_split: float = 240.0
+    # 손 검출 conf 하한 (perf-gap P1-7): 유령 손의 래치·궤적 오염 차단.
+    # 원본 운영값 0.30 (기본 0.40, 실배포 .env 0.30).
+    hand_confidence_threshold: float = 0.30
+    # side 카메라 hand 추론 (이슈 #18): side allowlist에 hand(0) 포함 —
+    # side에서도 래치(I16)·hand_path 손 근접 게이팅이 작동해 정지 진열
+    # 오투표를 거른다. 원본에 없는 신설 동작이라 기본 off. dual_top_proxy
+    # (냉동)에서는 side 스트림이 top 뷰라 의미가 다르니 냉장 전용으로 켤 것.
+    side_hand_enabled: bool = False
+    # side 전용 손 conf 하한. side는 손 1건이 hand_path를 무장시키는
+    # 방아쇠라 top보다 조일 수 있게 분리. 음수(기본) = hand_confidence_
+    # threshold 상속.
+    side_hand_confidence_threshold: float = -1.0
+    # ---- 판정 I-V 노브 (이슈 #15, FreezerVisionFirst 단계별 임계) ----
+    # single_share: top 득표 대비 이 비율 이상만 단일 정체성 교체 시도 허용
+    # combo_share: 조합 멤버 자격 하한 / refit_share: 유일-적합 구제 자격 하한
+    # near_factor: count_gate × 이 배수까지를 "접촉 오염 마진"으로 간주
+    judgment_single_share: float = 0.5
+    judgment_combo_share: float = 0.3
+    judgment_near_factor: float = 2.0
+    judgment_refit_share: float = 0.1
+    # ---- 무게 중재 재설계 노브 (이슈 #16) ----
+    # 설계: docs/devdoc/design/0722_issue16_arbitration_design.md
+    # count_unit_slack: 개수당 게이트 가산(g) — gate_n(n)=gate+slack×(n−1) (0=flat)
+    # conf_override: ① 자격의 conf 문턱 (share 미달 보완, 2.0=비활성)
+    # conf_margin: ① 복수 적합 중재에서 conf가 득표 서열을 뒤집는 최소 격차 (2.0=비활성)
+    judgment_count_unit_slack: float = 5.0
+    judgment_conf_override: float = 0.9
+    judgment_conf_margin: float = 0.15
+    # 무게 미검증 count=1 partial 청구의 conf 하한 (원본
+    # multi_kind_min_confidence=0.18 동형). 실기 ses-3-1784788285: 5표/청구
+    # conf 0.157 identity partial이 잔차 65g 오상품을 과금 — 저증거 청구 차단.
+    # 0 = 비활성 (구 동작).
+    judgment_partial_min_confidence: float = 0.18
+    # relaxed_partial 무게 반증 거부권 (이슈 #22 ses-4 z3): 무게 무검증
+    # count=1 폴백이 교차존 오염 득표 1위를 그대로 청구하던 구멍 — Δ-80g
+    # 이벤트에 단위무게 525g 상품 청구 (1개 취출조차 물리적으로 불가능).
+    # unit_weight > 최대 removal 관측량 + tolerance×이 계수 → 청구 부적격,
+    # 다음 후보로 (무게의 거부권, 후보 쇼핑 아님). 0 = 비활성 (구 동작).
+    judgment_partial_impossible_factor: float = 3.0
+    # StrictWeightMatcher 단일 종 ×N 개수 오컴 (이슈 #23 0806 3-1): n=1 적합의
+    # 최소 잔차보다 엄격히 더 잘 맞지 않는 단일 종 n≥2 조합 실격 — Δ-275에서
+    # 오로나민×1(잔차 0)과 단백질바 55×5(잔차 0)가 동률이 되자 conf 차이만으로
+    # ×5가 이겨 54x6 오과금. freezer ① COUNT_OCCAM의 냉장 strict판.
+    # False = 구 동작 (롤백).
+    judgment_strict_count_occam: bool = True
+    # ④ refit 복수 적합 중재의 절대 conf 하한 (실기 ses-1 ch1: 0.69 유령이
+    # margin 우세만으로 오과금 — 승자는 자체로 선명해야 한다). 2.0 = 중재
+    # 비활성(유일-적합만).
+    judgment_refit_arb_conf_floor: float = 0.8
+    # ① 개수 오컴 (0730 냉동 시나리오, strategies._occam_filter): n=1 적합이
+    # 있으면 그보다 잘 맞지 않는 n≥2 단일 가설을 적합 후보에서 실격한다 —
+    # 저중량 상품이 n을 키워 아무 중량대나 덮는 "만능 filler"가 되던 통로
+    # (2-8 잭슨빌1 → 라라스윗2, 5-3 청양만두1 → 라라스윗3). 0 = 구 동작.
+    judgment_count_occam: bool = True
+    # ①⁺ 세그먼트 근거 조합 도전 (strategies._segment_combo_challenge): "A×2"와
+    # "A1+B1"은 무게로 구분 불가라 ①이 항상 ×N 단일로 확정한다 (0730 2-4:
+    # 메로나+월드콘 −150 → 월드콘×2). removal 세그먼트 ≥ MIN_SEGMENTS가 분리
+    # 취출을 증언할 때만 ③ 조합이 ①을 뒤집는다. 실측 1건 + 세그먼트 구조
+    # 미확인이라 기본 off — 아카이브로 확인 후 승격.
+    judgment_segment_combo: bool = False
+    judgment_segment_combo_min_segments: int = 2
+    # ---- 조기 종료 (D7) — removal & 비freezer에서만 유효 ----
+    # 기본 off (이슈 #22 0805 냉장 20종 실기): 후보 창 안의 무게 설명은
+    # "남은 프레임이 판정을 못 바꾼다"의 근거가 못 된다 — 정답 등장 전에
+    # 프리롤 진열·반사광 표가 delta를 설명해 종료된 오과금이 지배적
+    # (2-9·3-3, ses-38 z3: 진열 5표 86×3=258이 Δ-260 설명 → 정답 표 0).
+    # 처리량은 T2 배치 경로가 대체. 재활성화 시에도 전 재고 유일해 게이트
+    # (early_termination.py 모듈 docstring)가 강제된다.
+    early_termination_enabled: bool = False
+    # ---- 모션 게이트 오버라이드 (None = SensorProfile 기본값 유지) ----
+    # 프로파일 상수(냉장 0.02/8, 냉동 0.005/4)를 기기 전 존에 대해 덮어쓴다.
+    motion_gate_threshold: float | None = None
+    motion_gate_keepalive: int | None = None
+    # ---- 모션 변위 증거 (issue #16 후속 — 원본 변위 필터 이식) ----
+    # 변위 없는 카메라×클래스의 표를 combine에서 몰수. static_track이 못 잡는
+    # "깜빡이는 정지 물체"까지 커버해 baseline(손 타이밍 대리 신호)을 대체한다.
+    # floor None = 프로파일 기본(냉장 10px/냉동 12px) — 픽셀 임계라 1:1 크롭이면
+    # crop 원점(left/center)과 무관하게 그대로 유효.
+    motion_evidence_enabled: bool = True
+    motion_evidence_floor_px: float | None = None
+    # no_motion "측정 불가" 정책 (이슈 #18 후속): "forfeit"(현행) | "exempt"
+    # — 관측 1~2회 단편 트랙뿐인 클래스는 몰수 대신 면제 (빠른 취출이
+    # "no_motion"으로 죽는 역설 차단, motion_evidence.py 참조).
+    motion_unmeasurable_policy: str = "forfeit"
+    motion_measurable_min_obs: int = 3
+    # ---- T2 held 트랙 강등 (0713 A-2의 트랙 단위 재구현, 0723 문서 §8) ----
+    # carried-in(프리롤 head부터 지속 관측) 트랙의 표를 combine에서 몰수.
+    # 같은 클래스의 취출 트랙 표는 유지된다(S2 해소 — 클래스 단위 A-2 설계의
+    # 원리적 구멍). shadow = held_shadow 관측만(판정 무변경), active 승격은
+    # analyze-sessions에서 정답 클래스 held 플래그가 없음을 확인한 뒤.
+    held_track_demotion: str = "shadow"
+    held_track_min_head: int = 5
+    # ---- 로드셀 안정 판정 (0.8s 캐던스 기준값, 이슈 #14) ----
+    loadcell_stable_window: int = 3
+    loadcell_stability_threshold_grams: float = 2.5
+    # primary 분석기 선택 (이슈 #14): "bocpd"(기본 — 2026-07-23 정식 승격) |
+    # "plateau"(구 3연속 안정 창, 롤백 스위치). 승격 근거: 이슈 #17 실측
+    # 63관측/2 mismatch + 5차 ses-2(동시+빠른 취출에서 plateau가
+    # insufficient_stable_regions → delta 0 → 0원 누락, BOCPD는 −297.5±2.6
+    # 채널 분해까지 정확). BOCPD_SHADOW 병행 기록 장치는 승격 확정으로
+    # 2026-07-24 삭제 — 회귀 감시는 아카이브 delta 정오로 직접 한다.
+    loadcell_analyzer: str = "bocpd"
+    # 오염 delta 이중 타깃 재시도 (이슈 #10): |delta − sum(segments)|가 이
+    # 값을 넘으면(접촉 하중 오염 서명) delta 타깃 판정 실패 시 세그먼트 합
+    # 타깃으로 1회 재판정. 실측 오염 트리거 8~18g / 깨끗한 트리거 0.
+    segment_retry_gap_grams: float = 5.0
+    # ---- 교차존 비전 오염 페널티 (docs/devdoc/design/cross_zone_penalty.md) ----
+    # Phase 3 승격 완료 (2026-07-21): 운영 검증(PENALTY_ENABLED=1)을 거쳐
+    # 기본 ON. 비활성화하려면 MODEL__CROSS_ZONE__PENALTY_ENABLED=0.
+    cross_zone_penalty_enabled: bool = True
+    # 카메라 계약 상수 — CRK-CAMERA replay_duration/trigger duration과 단일 소스
+    # (trigger duration은 0.8s 로드셀 캐던스 대응으로 3.0 -> 4.0, CRK-CAMERA 7c8395f)
+    cross_zone_replay_s: float = 4.0
+    cross_zone_trigger_s: float = 4.0
+    # IO-BOARD 감지 지연 마진 (ε): 폴링 0.8s(지배 항) + serial/SSE ~0.1s + 여유.
+    # 구값 0.3은 0.099s 폴링 + EMA 꼬리 시절 산정. sign-flip relatch(최대 2.4s,
+    # 존 무게 0 교차 시)는 의도적으로 미포함 — 과도한 창 확장 방지.
+    cross_zone_epsilon_s: float = 1.0
+    # soft 페널티 계수 (α) / 페널티 소스 최소 신뢰도 (θ) — Phase 1 계측으로 보정
+    cross_zone_alpha: float = 0.5
+    cross_zone_source_conf_min: float = 0.35
+    # ---- 세션 고스트 원장 (0723 이슈 #17 P1, ledger/ghost_ledger.py) ----
+    # 옷 프린트 유령 표: 여러 존에서 자격 표를 얻고도 세션 내 무게 뒷받침이
+    # 0인 클래스를 CLOSE 2차 패스에서 강등. shadow(기본)는 notes 기록만 —
+    # active 승격은 analyze-sessions 라벨 대조(정답 클래스 오플래그율) 후.
+    ghost_mode: str = "shadow"
+    ghost_min_zones: int = 2
+    ghost_vote_floor: int = 3
+    ghost_alpha: float = 0.5
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        policy_raw = os.environ.get("MODEL__SESSION__ERROR_POLICY", "block_payment")
+        return cls(
+            close_timeout_s=_env_float("MODEL__CLOSE__BARRIER_TIMEOUT_S", 10.0),
+            close_grace_s=_env_float("MODEL__CLOSE__GRACE_S", 3.0),
+            worker_stall_timeout_s=_env_float("MODEL__CLOSE__WORKER_STALL_TIMEOUT_S", 120.0),
+            close_vision_combo=_env_bool("MODEL__CLOSE__VISION_COMBO", True),
+            close_combo_min_vote_ratio=_env_float(
+                "MODEL__CLOSE__COMBO_MIN_VOTE_RATIO", 0.5
+            ),
+            close_combo_min_conf=_env_float("MODEL__CLOSE__COMBO_MIN_CONF", 0.8),
+            close_combo_session_guard=_env_bool(
+                "MODEL__CLOSE__COMBO_SESSION_GUARD", True
+            ),
+            close_combo_override_max_conf=_env_float(
+                "MODEL__CLOSE__COMBO_OVERRIDE_MAX_CONF", 0.95
+            ),
+            batch_size=_env_int("MODEL__VISION__BATCH_SIZE", 1),
+            prefetch_depth=_env_int("MODEL__VIDEO__PREFETCH", 0),
+            tensor_input=_env_bool("MODEL__VISION__TENSOR_INPUT", False),
+            freezer_zones=_env_zones("MODEL__ZONES__FREEZER"),
+            cabinet_type=_env_cabinet_type("MODEL__MACHINE__CABINET_TYPE", "refrigerated"),
+            error_policy=ErrorSessionPolicy(policy_raw),
+            idempotency_ttl_s=_env_float("MODEL__TRIGGER__IDEMPOTENCY_TTL_S", 5.0),
+            outcomes_keep=_env_int("MODEL__TRIGGER__OUTCOMES_KEEP", 256),
+            keep_sessions=_env_int("MODEL__LEDGER__KEEP_SESSIONS", 4),
+            journal_retention_days=_env_int("MODEL__LEDGER__JOURNAL_RETENTION_DAYS", 14),
+            session_archive_dir=os.environ.get("MODEL__SESSION__ARCHIVE_DIR", "data/sessions"),
+            session_archive_retention_days=_env_int(
+                "MODEL__SESSION__ARCHIVE_RETENTION_DAYS", 14
+            ),
+            save_detections=_env_bool("MODEL__SESSION__SAVE_DETECTIONS", False),
+            top_confidence_threshold=_env_float(
+                "MODEL__VISION__TOP_CONFIDENCE_THRESHOLD", 0.70
+            ),
+            side_confidence_threshold=_env_float(
+                "MODEL__VISION__SIDE_CONFIDENCE_THRESHOLD", 0.70
+            ),
+            min_vote_ratio=_env_float("MODEL__VISION__MIN_VOTE_RATIO", 0.05),
+            min_vote_count=_env_int("MODEL__VISION__MIN_VOTE_COUNT", 3),
+            vote_ratio_denominator=_env_choice(
+                "MODEL__VISION__VOTE_RATIO_DENOMINATOR",
+                "gate",
+                ("gate", "hand_window"),
+            ),
+            min_vote_share=_env_float("MODEL__VISION__MIN_VOTE_SHARE", 0.1),
+            vote_conf_floor=_env_float("MODEL__VISION__CONF_FLOOR", 0.0),
+            conf_weight_top=_env_float("MODEL__VISION__CONF_WEIGHT_TOP", 0.60),
+            conf_weight_side=_env_float("MODEL__VISION__CONF_WEIGHT_SIDE", 0.40),
+            conf_weight_top_only=_env_float(
+                "MODEL__VISION__CONF_WEIGHT_TOP_ONLY", 0.60
+            ),
+            conf_weight_side_only=_env_float(
+                "MODEL__VISION__CONF_WEIGHT_SIDE_ONLY", 0.40
+            ),
+            conf_common_class_bonus=_env_float(
+                "MODEL__VISION__CONF_COMMON_CLASS_BONUS", 0.2
+            ),
+            side_roi_max_center_x=_env_float("MODEL__VISION__SIDE_ROI_MAX_CENTER_X", 400.0),
+            side_camera_crop=_env_choice(
+                "MODEL__VIDEO__SIDE_CROP", "center", ("center", "left")
+            ),
+            camera_layout=_env_choice(
+                "MODEL__VISION__CAMERA_LAYOUT", "dual", _VALID_CAMERA_LAYOUTS
+            ),
+            freezer_roi_vertical_region=_env_choice(
+                "MODEL__VISION__FREEZER_ROI_VERTICAL_REGION",
+                "upper",
+                ("upper", "lower", "off"),
+            ),
+            freezer_roi_y_split=_env_float("MODEL__VISION__FREEZER_ROI_Y_SPLIT", 300.0),
+            top_roi_enabled=_env_bool("MODEL__VISION__TOP_ROI_ENABLED", False),
+            top_roi_y_split=_env_float("MODEL__VISION__TOP_ROI_Y_SPLIT", 240.0),
+            hand_confidence_threshold=_env_float(
+                "MODEL__VISION__HAND_CONFIDENCE_THRESHOLD", 0.30
+            ),
+            side_hand_enabled=_env_bool("MODEL__VISION__SIDE_HAND_ENABLED", False),
+            side_hand_confidence_threshold=_env_float(
+                "MODEL__VISION__SIDE_HAND_CONFIDENCE_THRESHOLD", -1.0
+            ),
+            segment_retry_gap_grams=_env_float(
+                "MODEL__WEIGHT__SEGMENT_RETRY_GAP_GRAMS", 5.0
+            ),
+            judgment_single_share=_env_float("MODEL__JUDGMENT__SINGLE_SHARE", 0.5),
+            judgment_combo_share=_env_float("MODEL__JUDGMENT__COMBO_SHARE", 0.3),
+            judgment_near_factor=_env_float("MODEL__JUDGMENT__NEAR_FACTOR", 2.0),
+            judgment_refit_share=_env_float("MODEL__JUDGMENT__REFIT_SHARE", 0.1),
+            judgment_count_unit_slack=_env_float(
+                "MODEL__JUDGMENT__COUNT_UNIT_SLACK", 5.0
+            ),
+            judgment_conf_override=_env_float("MODEL__JUDGMENT__CONF_OVERRIDE", 0.9),
+            judgment_conf_margin=_env_float("MODEL__JUDGMENT__CONF_MARGIN", 0.15),
+            judgment_partial_min_confidence=_env_float(
+                "MODEL__JUDGMENT__PARTIAL_MIN_CONFIDENCE", 0.18
+            ),
+            judgment_partial_impossible_factor=_env_float(
+                "MODEL__JUDGMENT__PARTIAL_IMPOSSIBLE_FACTOR", 3.0
+            ),
+            judgment_strict_count_occam=_env_bool(
+                "MODEL__JUDGMENT__STRICT_COUNT_OCCAM", True
+            ),
+            judgment_refit_arb_conf_floor=_env_float(
+                "MODEL__JUDGMENT__REFIT_ARB_CONF_FLOOR", 0.8
+            ),
+            judgment_count_occam=_env_bool("MODEL__JUDGMENT__COUNT_OCCAM", True),
+            judgment_segment_combo=_env_bool(
+                "MODEL__JUDGMENT__SEGMENT_COMBO", False
+            ),
+            judgment_segment_combo_min_segments=_env_int(
+                "MODEL__JUDGMENT__SEGMENT_COMBO_MIN_SEGMENTS", 2
+            ),
+            early_termination_enabled=_env_bool(
+                "MODEL__VISION__EARLY_TERMINATION", False
+            ),
+            motion_gate_threshold=_env_opt_float("MODEL__VISION__MOTION_GATE_THRESHOLD"),
+            motion_evidence_enabled=_env_bool("MODEL__VISION__MOTION_EVIDENCE", True),
+            motion_evidence_floor_px=_env_opt_float(
+                "MODEL__VISION__MOTION_EVIDENCE_FLOOR_PX"
+            ),
+            motion_unmeasurable_policy=_env_choice(
+                "MODEL__VISION__MOTION_UNMEASURABLE",
+                "forfeit",
+                ("forfeit", "exempt"),
+            ),
+            motion_measurable_min_obs=_env_int(
+                "MODEL__VISION__MOTION_MEASURABLE_MIN_OBS", 3
+            ),
+            held_track_demotion=_env_choice(
+                "MODEL__VISION__HELD_TRACK_DEMOTION",
+                "shadow",
+                ("off", "shadow", "active"),
+            ),
+            held_track_min_head=_env_int("MODEL__VISION__HELD_TRACK_MIN_HEAD", 5),
+            motion_gate_keepalive=_env_opt_int("MODEL__VISION__MOTION_GATE_KEEPALIVE"),
+            loadcell_analyzer=_env_choice(
+                "MODEL__LOADCELL__ANALYZER", "bocpd", ("plateau", "bocpd")
+            ),
+            loadcell_stable_window=_env_int("MODEL__WEIGHT__STABLE_WINDOW", 3),
+            loadcell_stability_threshold_grams=_env_float(
+                "MODEL__WEIGHT__STABILITY_THRESHOLD_GRAMS", 2.5
+            ),
+            cross_zone_penalty_enabled=_env_bool(
+                "MODEL__CROSS_ZONE__PENALTY_ENABLED", True
+            ),
+            cross_zone_replay_s=_env_float("MODEL__CROSS_ZONE__REPLAY_S", 4.0),
+            cross_zone_trigger_s=_env_float("MODEL__CROSS_ZONE__TRIGGER_S", 4.0),
+            cross_zone_epsilon_s=_env_float("MODEL__CROSS_ZONE__EPSILON_S", 1.0),
+            cross_zone_alpha=_env_float("MODEL__CROSS_ZONE__ALPHA", 0.5),
+            cross_zone_source_conf_min=_env_float(
+                "MODEL__CROSS_ZONE__SOURCE_CONF_MIN", 0.35
+            ),
+            ghost_mode=_env_choice(
+                "MODEL__GHOST__MODE", "shadow", ("off", "shadow", "active")
+            ),
+            ghost_min_zones=_env_int("MODEL__GHOST__MIN_ZONES", 2),
+            ghost_vote_floor=_env_int("MODEL__GHOST__VOTE_FLOOR", 3),
+            ghost_alpha=_env_float("MODEL__GHOST__ALPHA", 0.5),
+        )

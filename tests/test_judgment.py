@@ -1,0 +1,1091 @@
+"""judgment: 라우터 순서(D3), strict(I5·I12), I6, freezer(I3), 세그먼트(D4), I8."""
+from conftest import cand
+
+from crk_model.core.profiles import FREEZER, REFRIGERATOR
+from crk_model.core.types import (
+    ActiveProduct,
+    JudgmentResult,
+    JudgmentStatus,
+    ProductCount,
+    WeightSegment,
+)
+from crk_model.judgment import (
+    JudgmentContext,
+    JudgmentRouter,
+    StrictWeightMatcher,
+    default_pipeline,
+    enforce_full_delta_match,
+)
+
+
+def ctx(delta, products, candidates, profile=REFRIGERATOR, segments=(), vision_only=False):
+    return JudgmentContext(
+        zone=1, profile=profile, delta_weight=delta,
+        segments=tuple(segments), vision_candidates=tuple(candidates),
+        active_products=tuple(products), vision_only=vision_only,
+    )
+
+
+class TestPipelineOrder:
+    def test_diagram5_order_preserved(self):
+        names = [e.name for e in default_pipeline()]
+        assert names == [
+            "vision_only", "freezer_vision_first", "augment_stage_weight_gate",
+            "segment_weight_matching", "stage_count_combo", "no_candidate_fallback",
+            "min_weight_gate", "same_weight_collision_guard", "strict",
+            "stage_count_combo", "same_product_count", "relaxed",
+            "relaxed_loadcell_only", "vision_first_identity_partial",
+            "detected_single_item_fallback", "relaxed_partial", "forced_final",
+        ]
+
+
+class TestStrictMatcher:
+    def test_prefers_simpler_combination(self, cola, water):
+        # simplicity_score: 같은 오차·conf면 종류 수가 적은 조합 우선
+        m = StrictWeightMatcher()
+        best = m.best([cand(1), cand(2)], -300.0, [cola, water], 3.0)
+        counts = {pc.product.product_id: pc.count for pc in best.products}
+        assert counts == {"P001": 3}
+
+    def test_combination_across_kinds_when_stock_limits(self, cola, water):
+        # I12: stock 제한으로 단일 종류가 막히면 종류 조합으로
+        from dataclasses import replace
+
+        cola1 = replace(cola, stock_qty=1)
+        best = StrictWeightMatcher().best([cand(1), cand(2)], -300.0, [cola1, water], 3.0)
+        counts = {pc.product.product_id: pc.count for pc in best.products}
+        assert counts == {"P001": 1, "P002": 1}
+
+    def test_stock_zero_excluded(self, cola):
+        # I5: 품절 하드필터
+        from dataclasses import replace
+
+        sold_out = replace(cola, stock_qty=0)
+        assert StrictWeightMatcher().best([cand(1)], -100.0, [sold_out], 3.0) is None
+
+    def test_count_capped_by_stock(self, cola):
+        # I12: count ≤ stock (stock=5, 600g은 6개 필요 → 매칭 불가)
+        assert StrictWeightMatcher().best([cand(1)], -600.0, [cola], 3.0) is None
+
+    def test_target_below_tolerance_empty(self, cola):
+        assert StrictWeightMatcher().find_valid_combinations([cand(1)], -2.0, [cola], 3.0) == []
+
+    def test_vision_unseen_excluded(self, cola, water):
+        best = StrictWeightMatcher().best([cand(1)], -200.0, [cola, water], 3.0)
+        # water(200g)는 vision 미검출 → cola×2로만 설명
+        assert {pc.product.product_id: pc.count for pc in best.products} == {"P001": 2}
+
+
+class TestFullDeltaMatch:
+    def test_downgrades_partial_explanation(self, cola):
+        # I6: 부분 설명으로 과금 금지
+        r = JudgmentResult(JudgmentStatus.COMPLETE, (ProductCount(cola, 1),), 0.9, "strict")
+        out = enforce_full_delta_match(r, -250.0, 3.0)
+        assert out.status is JudgmentStatus.PARTIAL
+        assert "full_delta_unexplained" in out.reason
+
+    def test_relaxed_overreach_downgraded_by_router(self, cola):
+        # relaxed(tol×2)가 200g 조합을 내도 delta -178과 22g 차이 → I6이 PARTIAL 강등
+        router = JudgmentRouter()
+        result = router.judge(ctx(-178.0, [cola], [cand(1)]))
+        assert result.status is not JudgmentStatus.COMPLETE
+
+
+class TestFreezer:
+    def test_vision_first_single_not_summed(self, bar170, bar178, cola):
+        # 178g 사건 재발 방지: 근접 단일 후보(170g, 오차 8g ≤ 15g)가 있으면
+        # 후보들을 합쳐 청구하지 않는다 (I3 게이트)
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -178.0, [bar170, bar178, cola],
+            [cand(3, conf=0.9, votes=10), cand(4, conf=0.5, votes=3), cand(1, conf=0.4, votes=2)],
+            profile=FREEZER,
+        ))
+        assert result.strategy == "freezer_vision_first"
+        assert len(result.products) == 1
+        assert result.products[0].count == 1
+
+    def test_gate_near_miss_keeps_identity_as_partial(self, cola):
+        # I3 게이트(±15g)는 실패했지만 잔차(22g)가 오염 마진(2×gate=30) 내 —
+        # I-V(이슈 #15): 정체성 교체 대신 top 정체성·개수를 보존한 PARTIAL.
+        # COMPLETE 금지는 유지된다 (I6 방향).
+        router = JudgmentRouter()
+        result = router.judge(ctx(-178.0, [cola], [cand(1)], profile=FREEZER))
+        assert result.reason == "freezer_vision_first_near_gate"
+        assert result.status is JudgmentStatus.PARTIAL
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(1, 2)]
+
+    # 다품종 조합 테스트용 커스텀 무게 — freezer 게이트(±15g)에서 1·2종
+    # 조합으로는 우연 설명이 불가능하도록 서로 소인 큰 무게를 쓴다.
+    @staticmethod
+    def _multi_kind_products():
+        pa = ActiveProduct("PA", "A", class_id=11, unit_weight=970.0, unit_price=1000, stock_qty=5)
+        pb = ActiveProduct("PB", "B", class_id=12, unit_weight=610.0, unit_price=2000, stock_qty=5)
+        pc_ = ActiveProduct("PC", "C", class_id=13, unit_weight=210.0, unit_price=3000, stock_qty=5)
+        return pa, pb, pc_
+
+    def test_three_kind_combo_in_single_trigger(self):
+        # 한 트리거에 서로 다른 3종 (카메라가 연속 동작을 한 녹화로 합침):
+        # 2종 상한이던 조합을 k=2..4종으로 일반화 — 970+610+210=1790g은
+        # 1·2종 어떤 배분으로도 ±15g 내 설명 불가, 3종 1/1/1만 정답.
+        pa, pb, pc_ = self._multi_kind_products()
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -1790.0, [pa, pb, pc_],
+            [cand(11, conf=0.7, votes=30), cand(12, conf=0.6, votes=20),
+             cand(13, conf=0.5, votes=10)],
+            profile=FREEZER,
+        ))
+        assert result.strategy == "freezer_vision_first"
+        assert result.reason == "freezer_vision_first_combo"
+        counts = {p.product.product_id: p.count for p in result.products}
+        assert counts == {"PA": 1, "PB": 1, "PC": 1}
+
+    def test_unique_refit_rescues_when_top_decisively_refuted(self, water, bar178):
+        # 이슈 #8 계열: 최상위 후보가 오검출(반사 등)이고 잔차가 결정적
+        # (400 vs 178×2=356, 44g > 2×gate)일 때 — I-V의 유일한 예외인
+        # 유일-적합 구제로 water×2를 잡는다. 밴드(50%) 밖 하위 정체성이라도
+        # near(30g) 내 적합이 water 하나뿐이므로 무게 우연 채택이 아니다.
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -400.0, [water, bar178],
+            [cand(4, conf=0.9, votes=50), cand(2, conf=0.6, votes=10)],  # bar178이 1위
+            profile=FREEZER,
+        ))
+        assert result.reason == "freezer_vision_first_unique_refit"
+        assert result.status is JudgmentStatus.COMPLETE  # 잔차 0 → I6 통과
+        assert result.products[0].product.product_id == "P002"
+        assert result.products[0].count == 2
+
+    def test_refit_arbitration_resolves_when_vision_agrees(self):
+        # 실기 ses-3-1784790444 ch0 재현: top 24(28표/0.48)는 잔차 31.7로
+        # 반증, 정답 40(5표/0.82, 잔차 2.3)의 유일 적합을 35×2(4표/0.35,
+        # 잔차 −6.7)가 "적합 2개=모호"로 막았다 — 득표·conf 모두 40 우세이므로
+        # vision 중재로 채택돼야 한다.
+        p24 = ActiveProduct("P24", "24", class_id=24, unit_weight=165.0,
+                            unit_price=1000, stock_qty=5)
+        p13 = ActiveProduct("P13", "13", class_id=13, unit_weight=189.0,
+                            unit_price=1000, stock_qty=5)
+        p40 = ActiveProduct("P40", "40", class_id=40, unit_weight=131.0,
+                            unit_price=1000, stock_qty=5)
+        p35 = ActiveProduct("P35", "35", class_id=35, unit_weight=70.0,
+                            unit_price=1000, stock_qty=5)
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -133.3, [p24, p13, p40, p35],
+            [cand(24, conf=0.48, votes=28), cand(13, conf=0.83, votes=15),
+             cand(40, conf=0.82, votes=5), cand(35, conf=0.35, votes=4)],
+            profile=FREEZER,
+        ))
+        assert result.reason == "freezer_vision_first_refit_arbitrated"
+        assert result.status is JudgmentStatus.COMPLETE
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(40, 1)]
+
+    def test_refit_arbitration_requires_absolute_conf_floor(self):
+        # 실기 ses-1-1784791905 ch1 재현: 정답 23이 vision에 없는 상태에서
+        # 13(4표/0.69, 잔차 −11.5)이 24(3표/0.3, 잔차 12.5)를 margin 우세로
+        # 꺾고 COMPLETE 오과금 — margin만으로는 "덜 흐린 유령"이 이긴다.
+        # 중재 승자는 자체 conf ≥ 0.8이어야 하고, 미달이면 불발 → 기존
+        # 경로(identity partial → 병합 가드)가 과금을 억제한다.
+        p40 = ActiveProduct("P40", "40", class_id=40, unit_weight=131.0,
+                            unit_price=1000, stock_qty=5)
+        p13 = ActiveProduct("P13", "13", class_id=13, unit_weight=189.0,
+                            unit_price=1000, stock_qty=5)
+        p24 = ActiveProduct("P24", "24", class_id=24, unit_weight=165.0,
+                            unit_price=1000, stock_qty=5)
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -177.5, [p40, p13, p24],
+            [cand(40, conf=1.0, votes=11), cand(13, conf=0.69, votes=4),
+             cand(24, conf=0.3, votes=3)],
+            profile=FREEZER,
+        ))
+        assert result.reason != "freezer_vision_first_refit_arbitrated"
+        billed = [(pc.product.class_id, pc.count) for pc in result.products]
+        assert (13, 1) not in billed
+
+    def test_refit_arbitration_stays_ambiguous_without_decisive_evidence(self):
+        # 실기 ses-6 ch0 재현: 30(5표/0.80, 잔차 3) vs 44(4표/0.87, 잔차 6) —
+        # 득표·conf가 엇갈리고 conf 격차(0.07) < margin(0.15) → 종전대로 불발
+        # (identity partial이 top 정체성만 보존).
+        p13 = ActiveProduct("P13", "13", class_id=13, unit_weight=189.0,
+                            unit_price=1000, stock_qty=5)
+        p30 = ActiveProduct("P30", "30", class_id=30, unit_weight=82.0,
+                            unit_price=1000, stock_qty=5)
+        p44 = ActiveProduct("P44", "44", class_id=44, unit_weight=79.0,
+                            unit_price=1000, stock_qty=5)
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -85.0, [p13, p30, p44],
+            [cand(13, conf=0.80, votes=24), cand(30, conf=0.80, votes=5),
+             cand(44, conf=0.87, votes=4)],
+            profile=FREEZER,
+        ))
+        assert result.strategy == "vision_first_identity_partial"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(13, 1)]
+
+    def test_ambiguous_refit_refused_and_chain_not_leaked(self):
+        # 유일성 조건 + 체인 누수 방어: top(990g)이 결정적 반증(잔차 620)이고
+        # near(30g) 내 적합이 2개(185×2=370, 120×3=360)면 무게로는 고를 수
+        # 없다(I-V) → freezer_vision_first 불발. 이때 strict/relaxed가
+        # freezer로 새면 같은 무게 산술로 오식별을 재생산하므로(이슈 #15
+        # 누수) 배제되어야 하고, vision_first_identity_partial이 top 정체성만
+        # count=1 PARTIAL로 보존한다.
+        a = ActiveProduct("PA", "A", class_id=5, unit_weight=990.0, unit_price=1000, stock_qty=5)
+        b = ActiveProduct("PB", "B", class_id=6, unit_weight=185.0, unit_price=1000, stock_qty=5)
+        c = ActiveProduct("PC", "C", class_id=7, unit_weight=120.0, unit_price=1000, stock_qty=5)
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -370.0, [a, b, c],
+            [cand(5, conf=0.9, votes=100), cand(6, conf=0.5, votes=15),
+             cand(7, conf=0.5, votes=14)],
+            profile=FREEZER,
+        ))
+        assert result.strategy == "vision_first_identity_partial"
+        assert result.status is JudgmentStatus.PARTIAL
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(5, 1)]
+        assert router.telemetry["strict"] == 0
+        assert router.telemetry["relaxed"] == 0
+
+    def test_combo_prefers_fewer_kinds(self):
+        # 특이도: 2종으로 설명 가능하면(970+610=1580) 3종 조합을 만들지 않는다
+        pa, pb, pc_ = self._multi_kind_products()
+        router = JudgmentRouter()
+        result = router.judge(ctx(
+            -1580.0, [pa, pb, pc_],
+            [cand(11, votes=30), cand(12, votes=20), cand(13, votes=10)],
+            profile=FREEZER,
+        ))
+        assert result.reason == "freezer_vision_first_combo"
+        counts = {p.product.product_id: p.count for p in result.products}
+        assert counts == {"PA": 1, "PB": 1}
+
+
+class TestSegmentMatching:
+    def test_segments_resolve_aggregate_ambiguity(self, bar170, bar178):
+        # 합계 348g은 모호해도 구간 -170/-178은 각각 유일 (QA Q3)
+        segments = [WeightSegment(0, 1, -170.0), WeightSegment(1, 2, -178.0)]
+        router = JudgmentRouter()
+        result = router.judge(ctx(-348.0, [bar170, bar178], [cand(3), cand(4)], segments=segments))
+        assert result.strategy == "segment_weight_matching"
+        counts = {pc.product.product_id: pc.count for pc in result.products}
+        assert counts == {"P170": 1, "P178": 1}
+
+    def test_single_segment_falls_to_strict(self, cola):
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-100.0, [cola], [cand(1)], segments=[WeightSegment(0, 1, -100.0)])
+        )
+        assert result.strategy == "strict"
+
+
+class TestGuards:
+    def test_min_weight_gate(self, cola):
+        router = JudgmentRouter()
+        result = router.judge(ctx(-2.0, [cola], [cand(1)]))
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.reason == "below_min_weight_change"  # I8 사유 코드
+
+    def test_same_weight_collision_prefers_confidence(self, cola):
+        twin = cola.__class__(**{**cola.__dict__, "product_id": "P099", "class_id": 9})
+        router = JudgmentRouter()
+        result = router.judge(ctx(-100.0, [cola, twin], [cand(1, conf=0.6), cand(9, conf=0.9)]))
+        assert result.strategy == "same_weight_collision_guard"
+        assert result.products[0].product.product_id == "P099"
+
+    def test_vision_only_count_one(self, cola):
+        router = JudgmentRouter()
+        result = router.judge(ctx(0.0, [cola], [cand(1, conf=0.8)], vision_only=True))
+        assert result.strategy == "vision_only"
+        assert result.products[0].count == 1
+        assert abs(result.confidence - 0.8 * 0.7) < 1e-9
+
+    def test_no_candidates_weight_only(self, cola):
+        router = JudgmentRouter()
+        result = router.judge(ctx(-100.0, [cola], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.reason == "weight_only"
+
+    def test_weight_only_single_match_with_nontrivial_pool(self, cola, water):
+        # issue #6 결함 수정: 풀에 2개 품목이 있어도 tolerance 내에 하나만
+        # 들어오면(cola=100g, water=200g, delta=-100g) 여전히 단일 매치로 확정된다.
+        router = JudgmentRouter()
+        result = router.judge(ctx(-100.0, [cola, water], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.reason == "weight_only"
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.products[0].product.product_id == "P001"
+        assert result.products[0].count == 1
+
+    def test_weight_only_no_longer_tries_multi_item_combination(self, cola, water):
+        # issue #6 오청구 재발 방지: cola(100g)+water(200g)이 섞인 조합으로
+        # 우연히 맞춰지던 delta(-290g)는, 동일 상품 n개 확장 이후에도 여전히
+        # 청구하지 않는다 — cola×n(100,200,300,...)·water×n(200,400,...) 어느
+        # 배수도 tolerance(3.0g) 내로 290g에 들어오지 않으므로(다품목 조합은
+        # 여전히 탐색하지 않는다) no_candidates_forced_final로 빠진다.
+        router = JudgmentRouter()
+        result = router.judge(ctx(-290.0, [cola, water], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.reason == "no_candidates_forced_final"
+
+    def test_weight_only_ambiguous_rejects_charge(self, cola):
+        from dataclasses import replace
+
+        # cola(100g)의 근접 쌍둥이(102g) — 둘 다 delta=-101g의 tolerance(3.0g) 내.
+        twin = replace(cola, product_id="P099", class_id=9, unit_weight=102.0)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-101.0, [cola, twin], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.reason == "weight_only_ambiguous"
+
+    def test_telemetry_counts_hits(self, cola):
+        router = JudgmentRouter()
+        router.judge(ctx(-100.0, [cola], [cand(1)]))
+        router.judge(ctx(-100.0, [cola], [cand(1)]))
+        assert router.telemetry["strict"] == 2
+
+
+class TestWeightOnlySameProductCount:
+    """weight_only 확장: 동일 상품 n개 제거도 유일 매칭이면 채택한다
+    (직전 수정이 count=1 유일 매칭으로 과도 제한했던 것을 완화)."""
+
+    def test_same_product_two_units_unique_match(self):
+        # 2 x 79g = 158g delta — 동일 상품 2개 제거가 유일하게 tolerance(3.0g)
+        # 내로 들어오면 count=2로 채택한다.
+        from crk_model.core.types import ActiveProduct
+
+        snack = ActiveProduct(
+            "P079", "스낵79", class_id=7, unit_weight=79.0, unit_price=1200, stock_qty=5
+        )
+        router = JudgmentRouter()
+        result = router.judge(ctx(-158.0, [snack], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.reason == "weight_only"
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.products[0].product.product_id == "P079"
+        assert result.products[0].count == 2
+
+    def test_two_products_both_plausible_is_ambiguous(self, cola):
+        # cola(100g) x2 = 200g와 water2(200g) x1 = 200g가 동시에 delta=-200g의
+        # tolerance(3.0g) 내로 들어오면 — 서로 다른 (product, n) 쌍 2개가 모두
+        # 그럴듯하므로 여전히 weight_only_ambiguous로 거부한다.
+        from dataclasses import replace
+
+        water2 = replace(cola, product_id="P200", class_id=8, unit_weight=200.0)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-200.0, [cola, water2], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.reason == "weight_only_ambiguous"
+
+    def test_count_exceeding_stock_excludes_candidate(self):
+        # stock=2인 상품에 대해 n=3(=237g)이 필요한 delta는 후보에서 제외되고
+        # (I12), 다른 매칭도 없으면 no_candidates_forced_final로 빠진다.
+        from crk_model.core.types import ActiveProduct
+
+        limited = ActiveProduct(
+            "P079L", "스낵79한정", class_id=9, unit_weight=79.0, unit_price=1200, stock_qty=2
+        )
+        router = JudgmentRouter()
+        result = router.judge(ctx(-237.0, [limited], []))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.reason == "no_candidates_forced_final"
+
+
+class TestNoCandidateFreezerSuppression:
+    """결함 수정: 후보 없음 상태에서 freezer는 weight_only로 "식별"하지 않는다."""
+
+    def test_freezer_suppresses_identity(self, bar170):
+        # freezer + vision 후보 없음 → loadcell_identity_suppressed (I3, QA Q1)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-178.0, [bar170], [], profile=FREEZER))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.reason == "loadcell_identity_suppressed"
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert result.products == ()
+
+    def test_refrigerator_keeps_weight_only(self, cola):
+        # 냉장고는 weight_is_discriminative=True → 기존 weight_only 유지 (회귀 방지)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-100.0, [cola], [], profile=REFRIGERATOR))
+        assert result.strategy == "no_candidate_fallback"
+        assert result.reason == "weight_only"
+        assert result.status is JudgmentStatus.COMPLETE
+
+
+class TestStageCountCombination:
+    def test_no_vision_uses_segment_targets(self, cola):
+        # 후보없음 체인 SC1: vision 후보가 없어도 segment_targets로 개수 조합 성립
+        segments = [WeightSegment(0, 1, -100.0), WeightSegment(1, 2, -100.0)]
+        router = JudgmentRouter()
+        result = router.judge(ctx(-200.0, [cola], [], segments=segments))
+        assert result.strategy == "stage_count_combo"
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.products[0].count == 2
+
+    def test_single_match_ignored_falls_through(self, cola):
+        # 원본 차별점: total_count<2인 단일 매치는 이 전략의 몫이 아님 →
+        # 세그먼트가 1개뿐이면 애초에 precondition 불충족(len>=2 요구) → strict로
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-100.0, [cola], [cand(1)], segments=[WeightSegment(0, 1, -100.0)])
+        )
+        assert result.strategy != "stage_count_combo"
+
+
+class TestDetectedSingleItemFallback:
+    def test_rescues_when_strict_and_relaxed_miss(self, cola):
+        # strict(tol=5)·relaxed(tol*2=10) 둘 다 놓치는 잔차(12g)를 detected_single
+        # (tol*3=15)이 구제 — 단, I6이 원래 tolerance로 재검증해 PARTIAL 강등
+        # (tolerance 3→5 상향: 센서 보증 분해능 5g, profiles.py C3 참조)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-112.0, [cola], [cand(1, votes=10, conf=0.9)]))
+        assert result.strategy == "detected_single_item_fallback"
+        assert result.products[0].count == 1
+        assert result.products[0].product.product_id == "P001"
+
+    def test_two_detected_kinds_not_applied(self, cola, water):
+        # "사실상 1종뿐"만 대상 — top 후보만 보므로 2종 감지에서도 동작 자체는
+        # 하지만 same_weight 등 앞선 전략이 이미 처리 못 한 잔차만 넘어옴을 확인
+        # (여기서는 top 후보가 명확한 상황에서도 다른 전략이 우선함을 검증)
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-300.0, [cola, water], [cand(1, votes=10, conf=0.9), cand(2, votes=1, conf=0.3)])
+        )
+        # cola*3=300은 strict가 정확히 잡음 → detected_single까지 갈 필요 없음
+        assert result.strategy == "strict"
+
+
+class TestRelaxedLoadcellOnly:
+    def test_allowlist_mismatch_fridge_only(self, cola):
+        # vision이 active_products에 없는 클래스를 감지 → allowlist 완전 불일치
+        # → relaxed_loadcell_only가 전 재고에서 nearest-single 탐색 (냉장고만)
+        router = JudgmentRouter()
+        result = router.judge(ctx(-99.0, [cola], [cand(999, votes=10, conf=0.9)]))
+        assert result.strategy == "relaxed_loadcell_only"
+        assert result.status is JudgmentStatus.PARTIAL
+        assert result.products[0].product.product_id == "P001"
+
+    def test_freezer_suppressed(self, bar170):
+        # freezer는 loadcell_only도 억제 (178g 사건 재발 방지 원리 동일 적용)
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-99.0, [bar170], [cand(999, votes=10, conf=0.9)], profile=FREEZER)
+        )
+        assert result.strategy != "relaxed_loadcell_only"
+
+
+class TestVisionFirstIdentityPartial:
+    def test_freezer_preserves_identity_after_relaxed_miss(self, bar170):
+        # freezer_vision_first 게이트(±15g)도, relaxed(tol*2=30)도 실패하는
+        # 잔차(50g) → 정체성만 보존한 PARTIAL(count=1)
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-220.0, [bar170], [cand(3, votes=5, conf=0.7)], profile=FREEZER)
+        )
+        assert result.strategy == "vision_first_identity_partial"
+        assert result.status is JudgmentStatus.PARTIAL
+        assert result.products[0].count == 1
+        assert result.products[0].product.product_id == "P170"
+
+    def test_weight_validated_upgrades_to_complete(self, bar170):
+        # 무게검증이 tolerance 내로 통과하면 COMPLETE (개수 확정)
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-170.0, [bar170], [cand(3, votes=5, conf=0.7)], profile=FREEZER)
+        )
+        assert result.products[0].count == 1
+        assert result.status is JudgmentStatus.COMPLETE
+
+    def test_low_confidence_partial_billing_blocked(self, bar170):
+        # 실기 ses-3-1784788285 재현: 5표/conf 0.31(청구 conf 0.157)짜리
+        # identity partial이 잔차 65g 오상품을 과금 — 청구 conf 하한(0.18,
+        # 원본 multi_kind_min_confidence 동형) 미달은 청구하지 않는다.
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-100.0, [bar170], [cand(3, votes=5, conf=0.31)], profile=FREEZER)
+        )
+        assert result.status is JudgmentStatus.NO_DETECTION
+        assert not result.products
+
+    def test_partial_floor_zero_restores_old_behavior(self, bar170):
+        # 하한 0 = 구 동작 롤백 스토리 (env로 즉시 복원 가능)
+        from crk_model.judgment.router import default_pipeline
+
+        router = JudgmentRouter(default_pipeline(partial_min_confidence=0.0))
+        result = router.judge(
+            ctx(-100.0, [bar170], [cand(3, votes=5, conf=0.31)], profile=FREEZER)
+        )
+        assert result.strategy == "vision_first_identity_partial"
+        assert result.status is JudgmentStatus.PARTIAL
+
+    def test_weight_validated_complete_unaffected_by_floor(self, bar170):
+        # COMPLETE(무게 검증) 경로는 하한과 무관 — 저conf여도 무게가 검증하면 청구
+        router = JudgmentRouter()
+        result = router.judge(
+            ctx(-170.0, [bar170], [cand(3, votes=5, conf=0.3)], profile=FREEZER)
+        )
+        assert result.status is JudgmentStatus.COMPLETE
+
+
+class TestIssue10MelonaFiller:
+    """이슈 #10 세션 3(ses-1-1783926841) 트리거 1 재현 — 무게 filler 채택.
+
+    press로 부풀려진 delta(−241.77, 실제 비비고 224g)에 비비고가 count_gate
+    (±15)를 2.8g 차이로 놓치고, 8표(1위의 4%)짜리 메로나가 79×3=237로
+    채택되던 사고. 방어는 voting의 min_vote_share가 담당하고(combine에서
+    메로나 제거), 여기서는 제거 전/후 후보 셋에 대한 판정 경로를 고정한다.
+    """
+
+    BIBIGO = ActiveProduct("P175", "비비고만두", class_id=3, unit_weight=224.0,
+                           unit_price=3700, stock_qty=35)
+    COOZ = ActiveProduct("P173", "쿠즈락만두", class_id=13, unit_weight=189.0,
+                         unit_price=2100, stock_qty=40)
+    MELONA = ActiveProduct("P17M", "메로나", class_id=44, unit_weight=79.0,
+                           unit_price=800, stock_qty=38)
+
+    def test_low_share_filler_rejected_even_without_floor(self):
+        # I-V (이슈 #15 개정): share 하한이 없어도 판정층 자체가 filler를
+        # 거부하고 정답을 복원한다 — 메로나(8표, top의 4%)는 밴드(50%)·
+        # 조합(30%)·구제(refit 10%) 전부 밖이라 적합/모호성 판단에서 제외.
+        # top(쿠즈락) 결정적 반증 후 남는 적합은 비비고(잔차 17.77) 하나 →
+        # 유일-적합 구제, I6이 PARTIAL 강등 — 품목·수량 정답.
+        # (개정 전에는 이 후보 셋에서 79×3=237이 COMPLETE 채택되던 사고 경로.)
+        result = JudgmentRouter().judge(ctx(
+            -241.77, [self.BIBIGO, self.COOZ, self.MELONA],
+            [cand(13, 0.72, 188, 0.61), cand(3, 0.93, 70, 0.23),
+             cand(44, 0.67, 8, 0.026)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.PARTIAL
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(3, 1)]
+
+    def test_three_vote_filler_blocked_by_refit_floor(self):
+        # 이슈 #10 ses-1-1783924418 재현: 비비고 1개(delta −231.4, DB 등록
+        # 무게 200g → 잔차 31.4가 near(30) 밖)에서 3표(top 171의 1.75%)
+        # 멜로나가 79×3=237(잔차 5.6)로 "유일 적합"이 되어 COMPLETE 채택되던
+        # 사고. refit_share(10%)가 멜로나를 구제 대상에서 제외 → 멜로나
+        # 미과금, top 정체성 count=1 PARTIAL 보존.
+        bibigo200 = ActiveProduct("P3", "비비고200", class_id=3, unit_weight=200.0,
+                                  unit_price=3700, stock_qty=35)
+        bagel = ActiveProduct("P27", "베이글", class_id=27, unit_weight=140.0,
+                              unit_price=2800, stock_qty=30)
+        result = JudgmentRouter().judge(ctx(
+            -231.4, [bibigo200, self.COOZ, bagel, self.MELONA],
+            [cand(27, 0.65, 171), cand(13, 0.77, 88), cand(3, 0.82, 81),
+             cand(44, 0.60, 3)],
+            profile=FREEZER,
+        ))
+        assert all(pc.product.class_id != 44 for pc in result.products)
+        assert result.status is JudgmentStatus.PARTIAL
+
+    def test_share_floor_recovers_true_product(self):
+        # min_vote_share=0.1이 combine에서 메로나(8표 < 188×0.1)를 제거한
+        # 후보 셋이면: top(쿠즈락 189) 잔차 52.77로 결정적 반증 → near(30g)
+        # 내 적합이 비비고(잔차 17.77) 하나뿐 → 유일-적합 구제 채택,
+        # 잔차 17.77 > tol 15는 I6이 PARTIAL 강등 — 품목·수량이 정답 복원.
+        result = JudgmentRouter().judge(ctx(
+            -241.77, [self.BIBIGO, self.COOZ, self.MELONA],
+            [cand(13, 0.72, 188, 0.61), cand(3, 0.93, 70, 0.23)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.PARTIAL
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(3, 1)]
+
+
+class TestIssue15IdentityConsistency:
+    """이슈 #15 재현 — I-V: 무게 적합성이 정체성을 선택하지 못한다.
+
+    실기 사고: class 23(176g 등록) ×2 취출, delta −370(접촉 오염 +18g).
+    65표/0.86 1위(23)가 게이트를 3g 차이로 놓치자, 16표/0.66 배경 후보
+    (만두 185g×2=370)가 freezer_vision_first_single COMPLETE로 과금됐다."""
+
+    C23 = ActiveProduct("P23", "정답상품", class_id=23, unit_weight=176.0,
+                        unit_price=3000, stock_qty=40)
+    BAGEL = ActiveProduct("P27", "베이글", class_id=27, unit_weight=140.0,
+                          unit_price=2800, stock_qty=30)
+    DUMPLING = ActiveProduct("P13", "쿠즈락만두", class_id=13, unit_weight=185.0,
+                             unit_price=2100, stock_qty=40)
+
+    def test_near_gate_keeps_top_identity_and_count(self):
+        result = JudgmentRouter().judge(ctx(
+            -370.0, [self.C23, self.BAGEL, self.DUMPLING],
+            [cand(23, 0.86, 65), cand(27, 0.73, 27), cand(13, 0.66, 16)],
+            profile=FREEZER,
+        ))
+        # 370 vs 176×2=352: 잔차 18 ≤ gate_n(2)=20 (설계 3a n-스케일) → 이제
+        # ①에서 COMPLETE로 격상 (구 동작: near-gate PARTIAL — 과금 동일).
+        # 핵심 불변: 만두(185×2=370, 잔차 0!)는 share 25%·conf 0.66으로 자격
+        # 양문(single_share 50% / conf_override 0.9) 모두 미달 — 무게
+        # 갈아타기는 여전히 금지된다.
+        assert result.reason == "freezer_vision_first_single"
+        assert result.status is JudgmentStatus.COMPLETE
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 2)]
+
+
+class TestIssue16WeightArbitration:
+    """이슈 #16 설계 (docs/devdoc/design/0722_issue16_arbitration_design.md): 무게=거부권,
+    선택권=vision(득표+conf). n-스케일 게이트 + ① 선착 폐지 + conf 자격."""
+
+    BAGEL = ActiveProduct("P27", "베이글", class_id=27, unit_weight=155.0,
+                          unit_price=2800, stock_qty=30)
+    DUMPLING = ActiveProduct("P13", "쿠즈락만두", class_id=13, unit_weight=185.0,
+                             unit_price=2100, stock_qty=40)
+    C175 = ActiveProduct("P23", "정답175", class_id=23, unit_weight=175.0,
+                         unit_price=3000, stock_qty=40)
+
+    def test_case_c_vote_top_survives_coincidental_runner_fit(self):
+        # 실사고 (베이글 5개 연속 → 만두 4개 오과금): −743에서 베이글
+        # 5×155=775(잔차 32)는 gate_n(5)=35로 적합, 만두 4×185=740(잔차 3)도
+        # 적합. 구 선착 규칙은 1위(베이글) 실패 후 2위 만두를 확정했다 —
+        # 중재 기준은 잔차가 아니라 vision 증거(득표·conf 모두 베이글 우세).
+        result = JudgmentRouter().judge(ctx(
+            -743.0, [self.BAGEL, self.DUMPLING],
+            [cand(27, 1.0, 34), cand(13, 0.80, 25)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE  # I6도 gate_n 정합 (35≥32)
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(27, 5)]
+
+    def test_case_d_conf_override_and_margin_arbitration(self):
+        # 실사고 (진열 오염): 진열 만두 63표(conf 0.79)가 득표 1위 + 잔차 10
+        # 적합, 진짜 상품(conf 1.0)은 19표로 single_share(50%) 미달 —
+        # conf_override(0.9)로 자격을 얻고 conf_margin(0.15) 중재로 승리.
+        result = JudgmentRouter().judge(ctx(
+            -175.0, [self.DUMPLING, self.C175],
+            [cand(13, 0.79, 63), cand(23, 1.0, 19)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.reason == "freezer_vision_first_single_arbitrated"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 1)]
+
+    def test_ambiguous_fits_without_conf_dominance_fall_through(self):
+        # 전역 top 미적합 + 적합 2개(conf 격차 < margin) → ①은 결정하지 않고
+        # 폴스루, ④도 하드 게이트 2적합 모호 → 9.2가 top 정체성만 PARTIAL 보존.
+        a = ActiveProduct("PA", "A", class_id=5, unit_weight=990.0, unit_price=1000, stock_qty=5)
+        b = ActiveProduct("PB", "B", class_id=6, unit_weight=185.0, unit_price=1000, stock_qty=5)
+        c = ActiveProduct("PC", "C", class_id=7, unit_weight=120.0, unit_price=1000, stock_qty=5)
+        result = JudgmentRouter().judge(ctx(
+            -370.0, [a, b, c],
+            [cand(5, 0.9, 100), cand(6, 0.75, 60), cand(7, 0.8, 55)],
+            profile=FREEZER,
+        ))
+        assert result.strategy == "vision_first_identity_partial"
+        assert result.status is JudgmentStatus.PARTIAL
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(5, 1)]
+
+    def test_case_e_margin_saturates_at_conf_ceiling(self):
+        # 5차 ses-10 z1: vt conf 0.855 + margin 0.15 = 1.005 > conf 상한 1.0
+        # — 정답(conf 1.0, 잔차 0)조차 중재가 원리적으로 불가능하던 구조적
+        # 결함. min(0.99, vt+margin) 포화로 천장 압축을 반영한다.
+        result = JudgmentRouter().judge(ctx(
+            -175.0, [self.DUMPLING, self.C175],
+            [cand(13, 0.855, 63), cand(23, 1.0, 32)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.reason == "freezer_vision_first_single_arbitrated"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 1)]
+
+    def test_case_f_no_saturation_when_rival_also_at_ceiling(self):
+        # 8차 ses-4 실사고: vt 24(0.96, 126표, 잔차 10)와 bc 27(1.0, 66표,
+        # 잔차 0 — 반납으로 계속 손에 들려 conf 만점) 모두 적합. 포화가
+        # 1.0 ≥ min(0.99, 1.11)로 발동해 126표 정답 24를 뒤집었다. vt conf가
+        # conf_override(0.9) 이상이면 둘 다 천장 압축 구간 — conf 차이는
+        # 정보가 없으므로 포화 없이 득표 서열 유지.
+        p24 = ActiveProduct("P24", "P24", class_id=24, unit_weight=165.0,
+                            unit_price=2000, stock_qty=30)
+        p27 = ActiveProduct("P27b", "P27", class_id=27, unit_weight=155.0,
+                            unit_price=2800, stock_qty=30)
+        result = JudgmentRouter().judge(ctx(
+            -155.0, [p24, p27],
+            [cand(24, 0.96, 126), cand(27, 1.0, 66)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.reason == "freezer_vision_first_single"  # 중재 미발동
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(24, 1)]
+
+    def test_margin_disable_sentinel_skips_saturation(self):
+        # margin ≥ 1.0은 비활성 센티널("2.0=비활성", env 롤백 계약) — 포화를
+        # 적용하면 conf ≥ 0.99 후보가 비활성 설정에서도 중재를 발동해 버린다.
+        from crk_model.judgment.strategies import FreezerVisionFirstStrategy
+        legacy = FreezerVisionFirstStrategy(conf_margin=2.0)
+        result = legacy.solve(ctx(
+            -175.0, [self.DUMPLING, self.C175],
+            [cand(13, 0.855, 63), cand(23, 1.0, 32)],
+            profile=FREEZER,
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"  # 득표 서열 유지
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(13, 1)]
+
+    def test_rollback_knobs_restore_legacy_first_fit(self):
+        # env 롤백 스토리 (설계 §6): slack=0 + override/margin 비활성 →
+        # 구 동작(1위 적합 실패 → 2위 우연 적합 채택)이 재현된다.
+        from crk_model.judgment.strategies import FreezerVisionFirstStrategy
+        legacy = FreezerVisionFirstStrategy(
+            count_unit_slack=0.0, conf_override=2.0, conf_margin=2.0
+        )
+        result = legacy.solve(ctx(
+            -743.0, [self.BAGEL, self.DUMPLING],
+            [cand(27, 1.0, 34), cand(13, 0.80, 25)],
+            profile=FREEZER,
+        ))
+        assert result is not None
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(13, 4)]
+
+
+class TestCountOccam0730Scenario:
+    """0730 냉동 시나리오 배치 — ① 개수 오컴 (strategies._occam_filter).
+
+    실측 실패 7건 중 6건이 "서로 다른 2종을 1종 ×N으로 뭉갠다"는 한 서명이었고,
+    그 ×N의 주인공은 항상 70~95g대 저중량 상품이었다. 원인은 ①의 fit()이 개수를
+    무게에서 역산하는데(gate_n(n)=15+5×(n−1)로 창까지 넓어진다) 중재는 득표·conf
+    만 보는 비대칭 — 잔차 0짜리 n=1 정답이 잔차 15~24짜리 저중량 ×N에게 득표만으로
+    졌다. 아래 케이스 ID는 CRK_냉동시나리오테스트 0730_상세실행표의 행이다."""
+
+    # 실측 unit_weight (0730 단품 취출 delta 기준)
+    HOTDOG = ActiveProduct("P44", "잭슨빌 핫도그", class_id=44, unit_weight=155.0,
+                           unit_price=2500, stock_qty=30)
+    LALA = ActiveProduct("P30", "라라스윗", class_id=30, unit_weight=70.0,
+                         unit_price=1800, stock_qty=30)
+    CHEONGYANG = ActiveProduct("P23", "청양만두", class_id=23, unit_weight=225.0,
+                               unit_price=3500, stock_qty=30)
+    YOMAM = ActiveProduct("P35", "요맘때", class_id=35, unit_weight=95.0,
+                          unit_price=1500, stock_qty=30)
+    MELONA = ActiveProduct("P46", "메로나", class_id=46, unit_weight=80.0,
+                           unit_price=1000, stock_qty=30)
+
+    def test_case_2_8_single_beats_low_unit_double_despite_votes(self):
+        # 2-8: 2층 좌측 라라스윗이 우측 잭슨빌 취출 영상에 계속 잡혀 득표 1위가
+        # 됐다. 잭슨빌 155×1은 잔차 0인데, 라라스윗 70×2=140이 잔차 15로
+        # gate_n(2)=20을 통과해 "라라스윗 2개"로 과금됐다.
+        result = JudgmentRouter().judge(ctx(
+            -155.0, [self.HOTDOG, self.LALA],
+            [cand(30, 0.88, 90), cand(44, 0.86, 55)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(44, 1)]
+
+    def test_case_5_3_occam_scales_to_n3_window(self):
+        # 5-3: 청양만두 225×1은 잔차 8.8. 라라스윗 70×3=210은 잔차 23.8인데
+        # gate_n(3)=25라 통과 — 저중량 ×3의 창 [185,235]가 청양만두를 삼킨다.
+        result = JudgmentRouter().judge(ctx(
+            -233.8, [self.CHEONGYANG, self.LALA],
+            [cand(30, 0.9, 120), cand(23, 0.84, 70)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 1)]
+
+    def test_case_6_1_occam_survives_small_multiple_residual(self):
+        # 6-1: 요맘때 95×2=190은 잔차 5로 gate_n(2)=20 통과. 잭슨빌 1개는 잔차 0
+        # — n≥2가 잔차에서도 지면 실격이라는 규칙의 최소 마진 케이스.
+        result = JudgmentRouter().judge(ctx(
+            -155.0, [self.HOTDOG, self.YOMAM],
+            [cand(35, 0.92, 100), cand(44, 0.80, 60)],
+            profile=FREEZER,
+        ))
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(44, 1)]
+
+    def test_genuine_double_pick_survives_when_it_explains_better(self):
+        # 반대 방향 안전성: 메로나를 **진짜 2개** 꺼낸 −160. 메로나 80×2는 잔차 0,
+        # 배경 잭슨빌 155×1은 잔차 5 — n≥2가 더 잘 설명하므로 실격되지 않고,
+        # 최종 선택은 종전대로 vision 증거(득표)가 한다.
+        result = JudgmentRouter().judge(ctx(
+            -160.0, [self.MELONA, self.HOTDOG],
+            [cand(46, 0.9, 120), cand(44, 0.7, 20)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(46, 2)]
+
+    def test_no_single_fit_leaves_multiples_untouched(self):
+        # n=1 적합이 아예 없으면(진짜 다량 취출) 규칙 무발동 — 2-2 청양만두 3개.
+        result = JudgmentRouter().judge(ctx(
+            -680.0, [self.CHEONGYANG, self.LALA],
+            [cand(23, 0.95, 140), cand(30, 0.8, 40)],
+            profile=FREEZER,
+        ))
+        assert result.status is JudgmentStatus.COMPLETE
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 3)]
+
+    def test_low_evidence_single_cannot_disqualify_a_multiple(self):
+        # I-V 안전핀: 오컴의 기준점은 **자격(eligible)을 통과해 fits에 든 n=1**
+        # 뿐이다. 5표/conf 0.5짜리 배경 잭슨빌은 single_share(50%)·conf_override
+        # (0.9) 양문 모두 미달이라 fits에 못 들어가고, 따라서 라라스윗 ×2를
+        # 실격시키지 못한다 — "저득표 배경 후보가 n=1이라는 이유만으로 진짜 다량
+        # 취출을 무너뜨린다"는 이슈 #15형 역전이 이 경로로는 재발하지 않는다.
+        result = JudgmentRouter().judge(ctx(
+            -155.0, [self.HOTDOG, self.LALA],
+            [cand(30, 0.88, 90), cand(44, 0.5, 5)],
+            profile=FREEZER,
+        ))
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(30, 2)]
+
+    def test_rollback_knob_restores_legacy_multiple(self):
+        # env 롤백 계약 (MODEL__JUDGMENT__COUNT_OCCAM=0): 2-8이 실측 오답으로 복귀.
+        from crk_model.judgment.strategies import FreezerVisionFirstStrategy
+        legacy = FreezerVisionFirstStrategy(count_occam=False)
+        result = legacy.solve(ctx(
+            -155.0, [self.HOTDOG, self.LALA],
+            [cand(30, 0.88, 90), cand(44, 0.86, 55)],
+            profile=FREEZER,
+        ))
+        assert result is not None
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(30, 2)]
+
+
+class TestSegmentBackedCombo0730Case24:
+    """0730 2-4 — ①⁺ 세그먼트 근거 조합 도전 (기본 off, 명시 활성 시에만).
+
+    2-4: 5층 좌측 메로나(80g)와 우측 월드콘(70g)을 **순차적으로** 각 1개씩.
+    delta −150을 무게만으로는 "월드콘×2"(140, 잔차 10) "메로나×2"(160, 잔차 10)
+    "메로나1+월드콘1"(150, 잔차 0) 셋 중 무엇으로도 읽을 수 있고, gate_n(2)=20이
+    앞의 둘을 모두 허용한다. ①이 ③보다 먼저라 정답 조합은 도달조차 못 했다.
+    개수 오컴도 무발동 — 경쟁 적합이 전부 n=2라 n=1 기준점이 없다.
+
+    분리 신호는 로드셀 세그먼트다: 순차 취출은 removal 세그먼트 2개를 남기고
+    (냉동 segment_step=20g이라 70~80g 취출은 확실히 분리), 동시 취출은 1개다."""
+
+    MELONA = ActiveProduct("P46", "메로나", class_id=46, unit_weight=80.0,
+                           unit_price=1000, stock_qty=30)
+    WORLD = ActiveProduct("P40", "월드콘", class_id=40, unit_weight=70.0,
+                          unit_price=1200, stock_qty=30)
+    BAGEL = ActiveProduct("P27", "널담 베이글", class_id=27, unit_weight=152.5,
+                          unit_price=2800, stock_qty=30)
+    HOTDOG = ActiveProduct("P44", "잭슨빌 핫도그", class_id=44, unit_weight=155.0,
+                           unit_price=2500, stock_qty=30)
+
+    @staticmethod
+    def _strategy(**kw):
+        from crk_model.judgment.strategies import FreezerVisionFirstStrategy
+
+        return FreezerVisionFirstStrategy(segment_combo=True, **kw)
+
+    @staticmethod
+    def _segs(*grams):
+        return [WeightSegment(0.0, 1.0, g) for g in grams]
+
+    def _case_2_4(self, **kw):
+        return self._strategy(**kw).solve(ctx(
+            -150.0, [self.WORLD, self.MELONA],
+            [cand(40, 0.9, 100), cand(46, 0.88, 85)],
+            profile=FREEZER, segments=self._segs(-80.0, -70.0),
+        ))
+
+    def test_sequential_two_kinds_beats_single_double(self):
+        result = self._case_2_4()
+        assert result is not None
+        assert result.status is JudgmentStatus.COMPLETE
+        assert result.reason == "freezer_vision_first_segment_combo"
+        assert sorted((pc.product.class_id, pc.count) for pc in result.products) == [
+            (40, 1), (46, 1),
+        ]
+
+    def test_default_off_keeps_legacy_single(self):
+        # 레포 관행: 신규 판정 기제의 기본값은 기존 동작. 실측 1건 + 세그먼트
+        # 구조 미확인이라 승격은 아카이브 확인 후.
+        from crk_model.judgment.strategies import FreezerVisionFirstStrategy
+
+        result = FreezerVisionFirstStrategy().solve(ctx(
+            -150.0, [self.WORLD, self.MELONA],
+            [cand(40, 0.9, 100), cand(46, 0.88, 85)],
+            profile=FREEZER, segments=self._segs(-80.0, -70.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(40, 2)]
+
+    def test_guard_c_simultaneous_pick_blocks_challenge(self):
+        # ⓒ 핵심 방어선 — 0730 3-2(널담 2개를 **한 손으로 동시에**, 1세그먼트).
+        # 조합(널담1+잭슨빌1 = 307.5, 잔차 2.5)이 ①(널담×2 = 305, 잔차 5)보다
+        # 잘 설명해도, 세그먼트가 "한 번의 취출"이라고 말하므로 도전 봉쇄.
+        result = self._strategy().solve(ctx(
+            -310.0, [self.BAGEL, self.HOTDOG],
+            [cand(27, 0.92, 110), cand(44, 0.85, 70)],
+            profile=FREEZER, segments=self._segs(-310.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(27, 2)]
+
+    def test_guard_e_sequential_same_product_keeps_single(self):
+        # ⓔ 2-1(널담 2개 순차 = 세그먼트 2개)은 도전 자격은 얻지만, ①(널담×2
+        # = 305, 잔차 1.7)이 조합(널담1+잭슨빌1 = 307.5, 잔차 4.2)보다 잘
+        # 설명하므로 뒤집히지 않는다 — 순차 취출이라고 무조건 조합이 아니다.
+        result = self._strategy().solve(ctx(
+            -303.3, [self.BAGEL, self.HOTDOG],
+            [cand(27, 0.92, 110), cand(44, 0.85, 70)],
+            profile=FREEZER, segments=self._segs(-152.5, -150.8),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(27, 2)]
+
+    def test_guard_b_perfect_single_is_never_challenged(self):
+        # ⓑ ① 잔차 0(월드콘 정확히 2개 = 140)은 도전 대상이 아니다.
+        result = self._strategy().solve(ctx(
+            -140.0, [self.WORLD, self.MELONA],
+            [cand(40, 0.9, 100), cand(46, 0.88, 85)],
+            profile=FREEZER, segments=self._segs(-70.0, -70.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(40, 2)]
+
+    def test_guard_g_combo_cannot_claim_more_items_than_segments(self):
+        # ⓖ 세그먼트 2개인데 조합이 3개를 주장하면 근거가 없다.
+        # −220: ①은 월드콘 70×3 = 210(잔차 10 ≤ gate_n(3)=25), 조합은
+        # 월드콘2+메로나1 = 220(잔차 0)이지만 총 3개 > 세그먼트 2개 → 봉쇄.
+        result = self._strategy().solve(ctx(
+            -220.0, [self.WORLD, self.MELONA],
+            [cand(40, 0.9, 100), cand(46, 0.88, 85)],
+            profile=FREEZER, segments=self._segs(-150.0, -70.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(40, 3)]
+
+    def test_min_segments_knob_tightens_eligibility(self):
+        # ⓒ 문턱을 3으로 올리면 2세그먼트짜리 2-4는 도전 자격을 잃는다.
+        result = self._case_2_4(segment_combo_min_segments=3)
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+
+    def test_combo_share_gate_still_applies_to_challenge(self):
+        # ⓓ 도전 조합도 ③과 **동일한** 자격 규칙을 쓴다 — 메로나가 combo_share
+        # (top 득표의 30%) 미달이면 조합 자체가 성립하지 않는다.
+        result = self._strategy().solve(ctx(
+            -150.0, [self.WORLD, self.MELONA],
+            [cand(40, 0.9, 100), cand(46, 0.95, 20)],
+            profile=FREEZER, segments=self._segs(-80.0, -70.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(40, 2)]
+
+    def test_guard_f_combo_cannot_inflate_item_count(self):
+        # ⓕ 오컴 유지 — 세그먼트가 넉넉해도(4개) 조합이 ①보다 **많은 개수**를
+        # 주장하면 봉쇄. A(100g)×2 = 200(잔차 10)를 A1+B3(190, 잔차 0)이 이기지
+        # 못한다: "1종 2개"를 "2종 4개"로 부풀리는 방향은 금지.
+        a = ActiveProduct("PA", "A", class_id=51, unit_weight=100.0,
+                          unit_price=1000, stock_qty=10)
+        b = ActiveProduct("PB", "B", class_id=52, unit_weight=30.0,
+                          unit_price=500, stock_qty=10)
+        result = self._strategy().solve(ctx(
+            -190.0, [a, b], [cand(51, 0.9, 100), cand(52, 0.5, 40)],
+            profile=FREEZER, segments=self._segs(-50.0, -50.0, -50.0, -40.0),
+        ))
+        assert result is not None
+        assert result.reason == "freezer_vision_first_single"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(51, 2)]
+
+
+class TestRelaxedPartialWeightRefute:
+    """이슈 #22 ses-4 z3 재구성: 다종 동시 취출로 이웃 존 상품(보리차 525g)이
+    교차존 오염 표로 득표 1위가 된 상태에서, strict/relaxed가 전부 실패하자
+    최종 폴백 relaxed_partial이 무게 검증 없이 Δ-80g에 525g 상품을 count=1
+    청구했다. 무게 반증 거부권: unit_weight가 최대 removal 관측량 +
+    tolerance×3을 넘는 후보는 1개 취출조차 물리적으로 불가능 — 청구 부적격."""
+
+    BARLEY = ActiveProduct(
+        "P35", "보리차", class_id=35, unit_weight=525.0, unit_price=1800, stock_qty=5
+    )
+    # 진짜 취출 상품 — DB 무게가 실측 delta(-80)와 15g 어긋나 strict(±5)/
+    # relaxed(±10)에 안 걸리는 상태 (relaxed_partial까지 내려오는 조건)
+    TEA = ActiveProduct(
+        "P28", "둥굴레차", class_id=28, unit_weight=95.0, unit_price=1500, stock_qty=5
+    )
+    CANDS = [cand(35, conf=0.54, votes=13), cand(28, conf=0.66, votes=5)]
+
+    def test_impossible_top_is_refuted_next_candidate_billed(self):
+        # 525g 상품은 Δ-80 이벤트에서 1개 취출조차 불가능 → 거부권 발동,
+        # 남은 후보 중 증거 서열대로 28이 청구된다 (후보 쇼핑 아님 — 배제).
+        result = JudgmentRouter().judge(ctx(-80.0, [self.BARLEY, self.TEA], self.CANDS))
+        assert result.strategy == "relaxed_partial"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(28, 1)]
+
+    def test_all_candidates_impossible_no_billing(self):
+        # 생존 후보가 없으면 청구하지 않는다 (I13: 과청구 > 미청구)
+        result = JudgmentRouter().judge(
+            ctx(-80.0, [self.BARLEY], [cand(35, conf=0.54, votes=13)])
+        )
+        assert result.status is JudgmentStatus.NO_DETECTION
+
+    def test_return_mixed_trigger_uses_max_removal_segment(self):
+        # net delta가 반품으로 줄어든 트리거: removal 세그먼트 최대값(-525)이
+        # 상한 — 525g 상품은 여전히 청구 가능해야 한다 (거부권 오발동 방지)
+        segs = [WeightSegment(1.0, 1.5, -525.0), WeightSegment(2.0, 2.5, 445.0)]
+        result = JudgmentRouter().judge(
+            ctx(-80.0, [self.BARLEY], [cand(35, conf=0.54, votes=13)], segments=segs)
+        )
+        assert result.strategy == "relaxed_partial"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(35, 1)]
+
+    def test_factor_zero_restores_old_behavior(self):
+        # 롤백 계약: MODEL__JUDGMENT__PARTIAL_IMPOSSIBLE_FACTOR=0 → 구 동작
+        router = JudgmentRouter(default_pipeline(partial_impossible_factor=0.0))
+        result = router.judge(ctx(-80.0, [self.BARLEY, self.TEA], self.CANDS))
+        assert result.strategy == "relaxed_partial"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(35, 1)]
+
+
+class TestStrictCountOccam:
+    """이슈 #23 0806 3-1 재구성: 단백질바55+오로나민275 동시 취출의 ch1 Δ-275
+    에서 오로나민×1(잔차 0)과 단백질바×5(55×5=275, 잔차 0)가 동률 — match_score
+    의 vision 항(conf 1.0 vs 0.93)만으로 ×5가 이겨 54x6 오과금. 무게가 역산한
+    단일 종 ×N 가설은 n=1 적합을 엄격히 더 잘 설명할 때만 자격이 있다
+    (freezer ① `_occam_filter`의 냉장 strict판)."""
+
+    ORONAMIN = ActiveProduct(
+        "P23", "오로나민", class_id=23, unit_weight=275.0, unit_price=1500, stock_qty=10
+    )
+    BAR = ActiveProduct(
+        "P54", "단백질바", class_id=54, unit_weight=55.0, unit_price=2500, stock_qty=10
+    )
+    CANDS = [cand(54, conf=1.0, votes=53), cand(23, conf=0.93, votes=38)]
+
+    def test_equal_residual_xn_loses_to_single(self):
+        result = JudgmentRouter().judge(ctx(-275.0, [self.ORONAMIN, self.BAR], self.CANDS))
+        assert result.strategy == "strict"
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(23, 1)]
+
+    def test_rollback_restores_old_behavior(self):
+        # MODEL__JUDGMENT__STRICT_COUNT_OCCAM=0 → conf 우세 ×5가 종전대로 승리
+        router = JudgmentRouter(default_pipeline(strict_count_occam=False))
+        result = router.judge(ctx(-275.0, [self.ORONAMIN, self.BAR], self.CANDS))
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(54, 5)]
+
+    def test_strictly_better_xn_survives(self):
+        # 0806 1-2 재구성: 구운란×2(72.5×2=145, 잔차 0)는 n=1 우연(짜파게티
+        # 150, 잔차 5)보다 엄격히 잘 맞으므로 실격되지 않는다
+        eggs = ActiveProduct(
+            "P28", "구운란", class_id=28, unit_weight=72.5, unit_price=2000, stock_qty=10
+        )
+        jjapa = ActiveProduct(
+            "P55", "짜파게티", class_id=55, unit_weight=150.0, unit_price=1000, stock_qty=10
+        )
+        result = JudgmentRouter().judge(
+            ctx(-145.0, [eggs, jjapa], [cand(28, conf=0.8), cand(55, conf=0.8)])
+        )
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(28, 2)]
+
+    def test_no_single_fit_keeps_multi_count(self):
+        # n=1 적합이 없으면 무발동 — 진짜 다량 취출(하늘보리×3) 보존
+        barley = ActiveProduct(
+            "P16", "하늘보리", class_id=16, unit_weight=519.0, unit_price=1600, stock_qty=10
+        )
+        result = JudgmentRouter().judge(
+            ctx(-1557.0, [barley, self.BAR], [cand(16, conf=0.9), cand(54, conf=0.5)])
+        )
+        assert [(pc.product.class_id, pc.count) for pc in result.products] == [(16, 3)]
